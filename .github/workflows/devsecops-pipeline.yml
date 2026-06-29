@@ -3,7 +3,7 @@ name: "PipelineFortress — SAST + Secrets + SCA + Build + Image Scan + IaC + SB
 on:
   push:
     branches:
-      - master
+      - ma
 
 env:
   # FIX: VERSION is NO LONGER calculated here in global env
