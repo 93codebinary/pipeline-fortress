@@ -557,3 +557,78 @@ jobs:
           echo "           Image | IaC | SBOM | DAST"
           echo "  Status : All gates passed - ArgoCD syncing"
           echo "========================================"
+
+
+  # ════════════════════════════════════════════════════════════
+  # JOB 10 — CONSOLIDATE FINDINGS + DEFECTDOJO IMPORT (self-hosted)
+  # Runs on your local self-hosted runner, next to DefectDojo.
+  # ════════════════════════════════════════════════════════════
+  consolidate_and_dojo_import:
+    name: "🛡️ Consolidate Findings + DefectDojo Import"
+    runs-on: self-hosted
+    needs: [secrets_scan, sast_scan, sca_scan, image_scan, iac_scan, sbom_generate, dast_scan]
+    if: always()
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download all scan artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: reports
+          pattern: "*-report"
+          merge-multiple: true
+
+      - name: List downloaded reports
+        run: ls -la reports/
+
+      - name: Merge all findings into a single JSON
+        run: |
+          python3 scripts/merge_findings.py --outdir reports --output all-findings.json
+          echo "----- Preview -----"
+          python3 -m json.tool all-findings.json | head -40
+
+      - name: Upload consolidated findings JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-findings-consolidated
+          path: all-findings.json
+          retention-days: 90
+
+      # ──────────────────────────────────────────────────────────
+      # Import into your locally running DefectDojo instance.
+      # DEFECTDOJO_URL   e.g. http://localhost:8080  (set as a repo/env secret
+      #                  or variable since the runner is local, "localhost"
+      #                  will correctly resolve to your own machine)
+      # DEFECTDOJO_API_KEY  your DefectDojo API v2 key (Settings > API)
+      # DEFECTDOJO_ENGAGEMENT_ID  set up once in the DefectDojo UI
+      # ──────────────────────────────────────────────────────────
+      - name: Import consolidated findings into DefectDojo
+        env:
+          DEFECTDOJO_URL: ${{ secrets.DEFECTDOJO_URL }}
+          DEFECTDOJO_API_KEY: ${{ secrets.DEFECTDOJO_API_KEY }}
+          DEFECTDOJO_ENGAGEMENT_ID: ${{ secrets.DEFECTDOJO_ENGAGEMENT_ID }}
+        run: |
+          curl -sS -X POST "${DEFECTDOJO_URL}/api/v2/import-scan/" \
+            -H "Authorization: Token ${DEFECTDOJO_API_KEY}" \
+            -F "scan_type=Generic Findings Import" \
+            -F "file=@all-findings.json" \
+            -F "engagement=${DEFECTDOJO_ENGAGEMENT_ID}" \
+            -F "active=true" \
+            -F "verified=false" \
+            -F "minimum_severity=Info" \
+            -F "close_old_findings=false" \
+            -F "scan_date=$(date +%F)" \
+            -F "tags=pipelinefortress,ci" \
+            -o dojo-import-response.json -w "\nHTTP %{http_code}\n"
+          echo "----- DefectDojo response -----"
+          cat dojo-import-response.json
+
+      - name: Upload DefectDojo import response
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dojo-import-response
+          path: dojo-import-response.json
+          retention-days: 30
