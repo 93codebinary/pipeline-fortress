@@ -3,7 +3,7 @@ name: "PipelineFortress — SAST + Secrets + SCA + Build + Image Scan + IaC + SB
 on:
   push:
     branches:
-      - ma
+      - main
 
 env:
   # FIX: VERSION is NO LONGER calculated here in global env
@@ -598,23 +598,28 @@ jobs:
 
       # ──────────────────────────────────────────────────────────
       # Import into your locally running DefectDojo instance.
-      # DEFECTDOJO_URL   e.g. http://localhost:8080  (set as a repo/env secret
-      #                  or variable since the runner is local, "localhost"
-      #                  will correctly resolve to your own machine)
-      # DEFECTDOJO_API_KEY  your DefectDojo API v2 key (Settings > API)
-      # DEFECTDOJO_ENGAGEMENT_ID  set up once in the DefectDojo UI
+      # DEFECTDOJO_URL       e.g. http://localhost:8080 (runner is local,
+      #                      so "localhost" correctly resolves to your machine)
+      # DEFECTDOJO_API_KEY   your DefectDojo API v2 key (Settings > API)
+      #
+      # No pre-created Product/Engagement needed — auto_create_context=True
+      # tells DefectDojo to create the Product Type, Product, and Engagement
+      # automatically by name on first import, and reuse them on every
+      # subsequent import (matched by name).
       # ──────────────────────────────────────────────────────────
       - name: Import consolidated findings into DefectDojo
         env:
           DEFECTDOJO_URL: ${{ secrets.DEFECTDOJO_URL }}
           DEFECTDOJO_API_KEY: ${{ secrets.DEFECTDOJO_API_KEY }}
-          DEFECTDOJO_ENGAGEMENT_ID: ${{ secrets.DEFECTDOJO_ENGAGEMENT_ID }}
         run: |
           curl -sS -X POST "${DEFECTDOJO_URL}/api/v2/import-scan/" \
             -H "Authorization: Token ${DEFECTDOJO_API_KEY}" \
             -F "scan_type=Generic Findings Import" \
             -F "file=@all-findings.json" \
-            -F "engagement=${DEFECTDOJO_ENGAGEMENT_ID}" \
+            -F "product_type_name=Personal Projects" \
+            -F "product_name=PipelineFortress" \
+            -F "engagement_name=CI Pipeline Runs" \
+            -F "auto_create_context=True" \
             -F "active=true" \
             -F "verified=false" \
             -F "minimum_severity=Info" \
