@@ -6,9 +6,8 @@ on:
       - main
 
 env:
-  # FIX: VERSION is NO LONGER calculated here in global env
-  # Global env runs before checkout so version.txt is not available yet
-  # VERSION is now calculated inside build_push job step (see below)
+  # VERSION is calculated inside build_push job after checkout
+  # Global env runs before checkout — version.txt not available yet
   DOCKERHUB_REPO: ${{ secrets.DOCKERHUB_USERNAME }}/gitops-juiceshop-devsecops
 
 jobs:
@@ -29,6 +28,14 @@ jobs:
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Ensure SARIF exists (even if no secrets found)
+        if: always()
+        run: |
+          if [ ! -f results.sarif ]; then
+            echo '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Gitleaks"}},"results":[]}]}' \
+              > results.sarif
+          fi
 
       - name: Upload Gitleaks SARIF report
         if: always()
@@ -70,20 +77,24 @@ jobs:
             . \
             || true
 
+      - name: Ensure SARIF exists and is valid
+        run: |
+          if [ ! -f semgrep-results.sarif ] || [ ! -s semgrep-results.sarif ]; then
+            echo '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Semgrep"}},"results":[]}]}' \
+              > semgrep-results.sarif
+          fi
+
       - name: Enforce SAST gate — fail on ERROR findings
         run: |
-          if [ ! -f semgrep-results.sarif ]; then
-            echo '{"runs":[{"results":[]}]}' > semgrep-results.sarif
-          fi
-          if [ ! -s semgrep-results.sarif ]; then
-            echo '{"runs":[{"results":[]}]}' > semgrep-results.sarif
-          fi
           ERROR_COUNT=$(python3 -c "
           import json, sys
           try:
               with open('semgrep-results.sarif') as f:
                   data = json.load(f)
-              errors = [r for r in data.get('runs',[{}])[0].get('results',[]) if r.get('level')=='error']
+              errors = [
+                  r for r in data.get('runs',[{}])[0].get('results',[])
+                  if r.get('level') == 'error'
+              ]
               print(len(errors))
           except Exception as e:
               sys.stderr.write(f'Warning: {e}\n')
@@ -127,6 +138,12 @@ jobs:
           exit-code: '0'
           format: json
           output: trivy-fs-results.json
+
+      - name: Ensure Trivy FS output exists
+        run: |
+          if [ ! -f trivy-fs-results.json ] || [ ! -s trivy-fs-results.json ]; then
+            echo '{"Results":[]}' > trivy-fs-results.json
+          fi
 
       - name: Enforce SCA severity gate
         run: |
@@ -183,45 +200,51 @@ jobs:
 
   # ════════════════════════════════════════════════════════════
   # JOB 4 — BUILD & PUSH DOCKER IMAGE
-  # VERSION FIX is applied here — step 1 of this job
   # ════════════════════════════════════════════════════════════
   build_push:
     name: "🐳 Build & Push Docker Image"
     runs-on: ubuntu-latest
     needs: [sast_scan, sca_scan]
 
+    outputs:
+      # Expose VERSION as a job output so downstream jobs can reference it
+      # via needs.build_push.outputs.version
+      version: ${{ steps.calc_version.outputs.version }}
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
       # ── VERSION FIX ────────────────────────────────────────────────────────
-      # ROOT CAUSE: version.txt contains "1.0" (float) not "1" (integer)
-      # bash $(( )) arithmetic only accepts integers — "1.0 + 1" throws error
+      # ROOT CAUSE: version.txt contains "1.0" (float) not "1" (integer).
+      # bash $(( )) only accepts integers — "1.0 + 1" throws an error.
       #
-      # HOW THIS FIX WORKS:
-      # Step 1: Read raw value from version.txt  → e.g. "1.0"
-      # Step 2: cut -d'.' -f1 strips the decimal → "1"
-      # Step 3: Integer arithmetic adds 1         → "2"
-      # Step 4: Write to $GITHUB_ENV             → available as $VERSION in ALL steps below
+      # FIX:
+      #   1. Read raw value  e.g. "1.0"
+      #   2. cut -d'.' -f1   strips decimal → "1"
+      #   3. Integer +1      → "2"
+      #   4. Write to GITHUB_ENV (runtime, post-checkout) AND outputs
       #
-      # WHY $GITHUB_ENV not global env:
-      # Global env: is evaluated BEFORE the runner checks out the repo
-      #             so version.txt does not exist yet when global env runs
-      # $GITHUB_ENV: is evaluated at runtime AFTER checkout — version.txt exists
+      # WHY NOT global env:
+      #   Global env is evaluated BEFORE checkout — version.txt doesn't exist.
+      #   GITHUB_ENV is evaluated at runtime AFTER checkout.
       # ──────────────────────────────────────────────────────────────────────
       - name: Calculate next version
+        id: calc_version
         run: |
           RAW=$(cat version.txt)
           INT=$(echo "$RAW" | cut -d'.' -f1)
           VERSION=$(( INT + 1 ))
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-          echo "version.txt contained: $RAW"
-          echo "Stripping decimal: $RAW -> $INT"
-          echo "Next version: $VERSION"
+          echo "VERSION=$VERSION"      >> $GITHUB_ENV
+          echo "version=$VERSION"      >> $GITHUB_OUTPUT
+          echo "version.txt raw value : $RAW"
+          echo "Stripped decimal      : $INT"
+          echo "Next version          : $VERSION"
 
       - name: Login to Docker Hub
         run: |
-          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | \
+            docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
 
       - name: Build Docker Image
         run: |
@@ -233,7 +256,8 @@ jobs:
 
       - name: Save Docker Image as tar
         run: |
-          docker save -o juiceshop-image.tar docker.io/${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}
+          docker save -o juiceshop-image.tar \
+            docker.io/${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}
 
       - name: Upload Docker Image tar as artifact
         uses: actions/upload-artifact@v4
@@ -269,6 +293,12 @@ jobs:
           exit-code: '0'
           format: json
           output: trivy-image-results.json
+
+      - name: Ensure Trivy image output exists
+        run: |
+          if [ ! -f trivy-image-results.json ] || [ ! -s trivy-image-results.json ]; then
+            echo '{"Results":[]}' > trivy-image-results.json
+          fi
 
       - name: Enforce image scan gate — fail on CRITICAL OS CVEs
         run: |
@@ -329,6 +359,13 @@ jobs:
             --soft-fail-on MEDIUM,LOW \
             || true
 
+      - name: Ensure Checkov output exists
+        run: |
+          if [ ! -f checkov-results.json ] || [ ! -s checkov-results.json ]; then
+            echo '{"results":{"passed_checks":[],"failed_checks":[]}}' \
+              > checkov-results.json
+          fi
+
       - name: Enforce IaC gate — fail on CRITICAL or HIGH
         run: |
           FAILED_COUNT=$(python3 -c "
@@ -383,15 +420,19 @@ jobs:
 
       - name: Install Syft
         run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          curl -sSfL \
+            https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin
 
       - name: Load Docker image from tar
         run: docker load -i juiceshop-image.tar
 
       - name: Generate SBOM in JSON format
         run: |
-          syft docker.io/${{ env.DOCKERHUB_REPO }}:${{ needs.build_push.outputs.version || env.VERSION }} -o json > sbom.json || \
-          syft juiceshop-image.tar -o json > sbom.json
+          # Try image reference first; fall back to tarball
+          syft docker.io/${{ env.DOCKERHUB_REPO }}:${{ needs.build_push.outputs.version }} \
+            -o json > sbom.json 2>/dev/null \
+            || syft juiceshop-image.tar -o json > sbom.json
           python3 -c "
           import json
           with open('sbom.json') as f:
@@ -404,9 +445,11 @@ jobs:
           syft juiceshop-image.tar -o spdx-json > sbom.spdx.json
 
       - name: Upload SBOM artifacts
+        # FIX: renamed from "sbom-reports" to "sbom-report" so it matches
+        # the "*-report" download pattern in Job 10
         uses: actions/upload-artifact@v4
         with:
-          name: sbom-reports
+          name: sbom-report
           path: |
             sbom.json
             sbom.spdx.json
@@ -437,13 +480,15 @@ jobs:
           docker run -d \
             --name juiceshop-dast \
             -p 3000:3000 \
-            $(docker images --format "{{.Repository}}:{{.Tag}}" | grep juiceshop | head -1)
+            $(docker images --format "{{.Repository}}:{{.Tag}}" \
+              | grep juiceshop | head -1)
 
       - name: Wait for app to be ready
         run: |
           echo "Waiting for Juice Shop to start..."
           for i in $(seq 1 30); do
-            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000 || echo "000")
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              http://localhost:3000 || echo "000")
             if [ "$HTTP_STATUS" = "200" ]; then
               echo "App is ready — HTTP $HTTP_STATUS"
               break
@@ -465,6 +510,13 @@ jobs:
             -I \
             || true
 
+      - name: Ensure ZAP output exists
+        run: |
+          if [ ! -f zap-report.json ] || [ ! -s zap-report.json ]; then
+            echo '{"site":[{"@name":"http://localhost:3000","alerts":[]}]}' \
+              > zap-report.json
+          fi
+
       - name: Enforce DAST gate — fail on HIGH alerts
         run: |
           HIGH_COUNT=$(python3 -c "
@@ -474,7 +526,7 @@ jobs:
                   data = json.load(f)
               count = sum(
                   1 for alert in data.get('site', [{}])[0].get('alerts', [])
-                  if alert.get('riskcode') == '3'
+                  if str(alert.get('riskcode','0')) == '3'
               )
               print(count)
           except Exception:
@@ -519,8 +571,8 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Recalculate version here too — each job runs on a fresh runner
-      # so GITHUB_ENV values from Job 4 are NOT available here
+      # Each job runs on a fresh runner — GITHUB_ENV from Job 4 is gone.
+      # Recalculate version here exactly as in Job 4.
       - name: Recalculate version
         run: |
           RAW=$(cat version.txt)
@@ -537,11 +589,12 @@ jobs:
       - name: Update deployment.yaml and version.txt
         run: |
           git pull
-          sed -i "s|image: .*/gitops-juiceshop-devsecops:.*|image: ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}|" deployment.yaml
-          echo ${{ env.VERSION }} > version.txt
-          CURRENT_VERSION=$(cat version.txt)
+          sed -i \
+            "s|image: .*/gitops-juiceshop-devsecops:.*|image: ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}|" \
+            deployment.yaml
+          echo "${{ env.VERSION }}" > version.txt
           git add deployment.yaml version.txt
-          git commit -m "ci: update image to ${CURRENT_VERSION} — all 8 security gates passed"
+          git commit -m "ci: update image to ${{ env.VERSION }} — all security gates passed"
           git push
 
       - name: Pipeline Summary
@@ -555,39 +608,66 @@ jobs:
           echo "  Branch : ${{ github.ref_name }}"
           echo "  Gates  : Secrets | SAST | SCA | Build"
           echo "           Image | IaC | SBOM | DAST"
-          echo "  Status : All gates passed - ArgoCD syncing"
+          echo "  Status : All gates passed — ArgoCD syncing"
           echo "========================================"
 
 
   # ════════════════════════════════════════════════════════════
-  # JOB 10 — CONSOLIDATE FINDINGS + DEFECTDOJO IMPORT (self-hosted)
-  # Runs on your local self-hosted runner, next to DefectDojo.
+  # JOB 10 — CONSOLIDATE FINDINGS + DEFECTDOJO IMPORT
+  # Runs on self-hosted runner (Kali) next to DefectDojo.
   # ════════════════════════════════════════════════════════════
   consolidate_and_dojo_import:
     name: "🛡️ Consolidate Findings + DefectDojo Import"
     runs-on: self-hosted
-    needs: [secrets_scan, sast_scan, sca_scan, image_scan, iac_scan, sbom_generate, dast_scan]
+    needs:
+      - secrets_scan
+      - sast_scan
+      - sca_scan
+      - image_scan
+      - iac_scan
+      - sbom_generate
+      - dast_scan
     if: always()
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # FIX: pattern changed from "*-report" to "*-report*"
+      # Reason: sbom artifact was renamed to "sbom-report" (singular)
+      # to match this pattern. All artifacts now match:
+      #   gitleaks-report, semgrep-report, trivy-fs-report,
+      #   trivy-image-report, checkov-report, zap-dast-report, sbom-report
       - name: Download all scan artifacts
         uses: actions/download-artifact@v4
         with:
           path: reports
-          pattern: "*-report"
+          pattern: "*-report*"
           merge-multiple: true
 
       - name: List downloaded reports
-        run: ls -la reports/
+        run: |
+          echo "=== Downloaded report files ==="
+          ls -lah reports/ || echo "reports/ is empty"
+
+      - name: Verify merge_findings.py exists
+        run: |
+          if [ ! -f scripts/merge_findings.py ]; then
+            echo "ERROR: scripts/merge_findings.py not found in repo"
+            echo "Add it to your repo: scripts/merge_findings.py"
+            exit 1
+          fi
+          echo "merge_findings.py found"
 
       - name: Merge all findings into a single JSON
         run: |
-          python3 scripts/merge_findings.py --outdir reports --output all-findings.json
-          echo "----- Preview -----"
-          python3 -m json.tool all-findings.json | head -40
+          python3 scripts/merge_findings.py \
+            --outdir reports \
+            --output all-findings.json \
+            --verbose
+          echo ""
+          echo "=== all-findings.json preview ==="
+          python3 -m json.tool all-findings.json | head -60
 
       - name: Upload consolidated findings JSON
         uses: actions/upload-artifact@v4
@@ -596,23 +676,23 @@ jobs:
           path: all-findings.json
           retention-days: 90
 
-      # ──────────────────────────────────────────────────────────
-      # Import into your locally running DefectDojo instance.
-      # DEFECTDOJO_URL       e.g. http://localhost:8080 (runner is local,
-      #                      so "localhost" correctly resolves to your machine)
-      # DEFECTDOJO_API_KEY   your DefectDojo API v2 key (Settings > API)
+      # ── DefectDojo Import ──────────────────────────────────────────────────
+      # DEFECTDOJO_URL    = http://localhost:8080
+      #   "localhost" resolves correctly here because this job runs on your
+      #   Kali machine (self-hosted runner), not on GitHub's cloud runners.
+      # DEFECTDOJO_API_KEY = API v2 key from DefectDojo → Settings → API
       #
-      # No pre-created Product/Engagement needed — auto_create_context=True
-      # tells DefectDojo to create the Product Type, Product, and Engagement
-      # automatically by name on first import, and reuse them on every
-      # subsequent import (matched by name).
-      # ──────────────────────────────────────────────────────────
-      - name: Import consolidated findings into DefectDojo
+      # auto_create_context=True:
+      #   Creates Product Type / Product / Engagement on first run.
+      #   Reuses them (matched by name) on every subsequent run.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Import findings into DefectDojo
         env:
-          DEFECTDOJO_URL: ${{ secrets.DEFECTDOJO_URL }}
+          DEFECTDOJO_URL:     ${{ secrets.DEFECTDOJO_URL }}
           DEFECTDOJO_API_KEY: ${{ secrets.DEFECTDOJO_API_KEY }}
         run: |
-          curl -sS -X POST "${DEFECTDOJO_URL}/api/v2/import-scan/" \
+          HTTP_CODE=$(curl -sS -X POST \
+            "${DEFECTDOJO_URL}/api/v2/import-scan/" \
             -H "Authorization: Token ${DEFECTDOJO_API_KEY}" \
             -F "scan_type=Generic Findings Import" \
             -F "file=@all-findings.json" \
@@ -625,10 +705,20 @@ jobs:
             -F "minimum_severity=Info" \
             -F "close_old_findings=false" \
             -F "scan_date=$(date +%F)" \
-            -F "tags=pipelinefortress,ci" \
-            -o dojo-import-response.json -w "\nHTTP %{http_code}\n"
-          echo "----- DefectDojo response -----"
-          cat dojo-import-response.json
+            -F "tags=pipelinefortress,ci,automated" \
+            -o dojo-import-response.json \
+            -w "%{http_code}")
+
+          echo "HTTP response code: $HTTP_CODE"
+          echo "=== DefectDojo response ==="
+          python3 -m json.tool dojo-import-response.json || cat dojo-import-response.json
+
+          # Fail the step if DefectDojo returned an error
+          if [[ "$HTTP_CODE" != "201" && "$HTTP_CODE" != "200" ]]; then
+            echo "DefectDojo import FAILED — HTTP $HTTP_CODE"
+            exit 1
+          fi
+          echo "DefectDojo import SUCCESS — HTTP $HTTP_CODE"
 
       - name: Upload DefectDojo import response
         if: always()
