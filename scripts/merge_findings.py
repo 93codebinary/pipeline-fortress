@@ -360,7 +360,6 @@ def to_dojo_finding(f):
         "active":          True,
         "verified":        False,
         "false_p":         False,
-        "duplicate":       False,
         "out_of_scope":    False,
         "static_finding":  f.get("static_finding", True),
         "dynamic_finding": f.get("dynamic_finding", False),
