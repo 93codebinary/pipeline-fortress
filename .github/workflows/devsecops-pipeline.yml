@@ -727,3 +727,88 @@ jobs:
           name: dojo-import-response
           path: dojo-import-response.json
           retention-days: 30
+
+
+  # ════════════════════════════════════════════════════════════
+  # JOB 11 — LLM TRIAGE (NVIDIA NIM)
+  # ════════════════════════════════════════════════════════════
+  llm_triage:
+    name: "🤖 LLM Triage — NVIDIA NIM"
+    runs-on: ubuntu-latest
+    needs: dast_scan
+    if: always()   # triage is MOST useful when a gate failed, so run regardless
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download all scanner reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-report*"
+          merge-multiple: true
+
+      - name: Install dependencies
+        run: pip install openai --break-system-packages
+
+      - name: Merge scanner outputs into one JSON
+        run: python3 triage/merge_findings.py
+
+      - name: Redact before anything leaves the runner
+        run: python3 triage/redact.py
+
+      - name: Verify redaction (fail build if a secret survived)
+        run: python3 triage/verify_redaction.py
+
+      - name: Run LLM triage via NVIDIA NIM
+        env:
+          NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY }}
+        run: python3 triage/triage.py
+
+      - name: Upload triage evidence artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llm-triage-output
+          path: |
+            consolidated_findings.json
+            redacted_findings.json
+            prompt_sent_to_llm.txt
+            triage_report.md
+            triage_report.json
+          retention-days: 90
+          
+
+  # ════════════════════════════════════════════════════════════
+  # JOB 12 — AUTO-FIX PR (Scenario A: fully automated)
+  # ════════════════════════════════════════════════════════════
+  auto_fix_pr:
+    name: "🔧 Auto-Fix PR — human must approve"
+    runs-on: ubuntu-latest
+    needs: llm_triage
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download triage report
+        uses: actions/download-artifact@v4
+        with:
+          name: llm-triage-output
+
+      - name: Generate remediation files from top-3 findings
+        run: python3 triage/make_fix_files.py
+
+      - name: Open Pull Request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: fix/llm-triage/auto-remediation
+          title: "security: LLM-drafted fixes for top 3 findings (needs human review)"
+          body-path: triage_report.md
+          commit-message: "security: add LLM-drafted remediation proposals"
+          labels: security, llm-generated
+          delete-branch: true        
