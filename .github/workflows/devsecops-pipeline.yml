@@ -812,4 +812,6 @@ jobs:
           body-path: triage_report.md
           commit-message: "security: add LLM-drafted remediation proposals"
           labels: security, llm-generated
-          delete-branch: true        
+          delete-branch: true
+          add-paths: |
+            security/remediation/**
