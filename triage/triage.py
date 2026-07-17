@@ -47,7 +47,7 @@ with open("prompt_sent_to_llm.txt", "w") as f:
     f.write(SYSTEM + "\n\n---\n\n" + prompt)
 
 resp = client.chat.completions.create(
-    model="nvidia/llama-3.3-nemotron-super-49b-v1.5",
+    model="meta/llama-3.3-70b-instruct",
     messages=[{"role": "system", "content": SYSTEM},
               {"role": "user", "content": prompt}],
     temperature=0.2, max_tokens=2000)
