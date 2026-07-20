@@ -8,6 +8,20 @@ on:
 env:
   DOCKERHUB_REPO: ${{ secrets.DOCKERHUB_USERNAME }}/gitops-juiceshop-devsecops
 
+# ════════════════════════════════════════════════════════════
+# CONCURRENCY — prevents two runs on the same branch racing to
+# bump version.txt. Without this, two runs read the same
+# version.txt, compute the same VERSION, and the second one
+# finds nothing to commit and fails.
+#
+# cancel-in-progress: false is deliberate — never cancel a run
+# that may have already pushed an image but not yet updated
+# the manifest.
+# ════════════════════════════════════════════════════════════
+concurrency:
+  group: pipelinefortress-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
 
   # ════════════════════════════════════════════════════════════
@@ -629,16 +643,50 @@ jobs:
           git config --global user.email "${{ secrets.GIT_EMAIL }}"
           git config --global user.name "${{ secrets.GIT_USERNAME }}"
 
+      # ── IDEMPOTENT GITOPS COMMIT ──────────────────────────────
+      # A GitOps reconciler that finds the desired state already
+      # present has SUCCEEDED, not failed. Previously `git commit`
+      # exited 1 on "nothing to commit" and failed the job.
+      #
+      # Also retries the push: a commit can land between our pull
+      # and our push, and losing that race should not fail a run
+      # that already published a verified image.
+      # ──────────────────────────────────────────────────────────
       - name: Update deployment.yaml and version.txt
         run: |
-          git pull
+          git pull --rebase
+
           sed -i \
             "s|image: .*/gitops-juiceshop-devsecops:.*|image: ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}|" \
             deployment.yaml
           echo "${{ env.VERSION }}" > version.txt
+
           git add deployment.yaml version.txt
+
+          if git diff --staged --quiet; then
+            echo "::notice::Manifests already at version ${{ env.VERSION }} — nothing to commit."
+            echo "GitOps state already correct. Exiting successfully."
+            exit 0
+          fi
+
           git commit -m "ci: update image to ${{ env.VERSION }} — all security gates passed"
-          git push
+
+          PUSHED=0
+          for i in 1 2 3; do
+            if git push; then
+              PUSHED=1
+              break
+            fi
+            echo "Push rejected — rebasing and retrying ($i/3)"
+            git pull --rebase || true
+            sleep 3
+          done
+
+          if [ "$PUSHED" != "1" ]; then
+            echo "Push failed after 3 attempts."
+            exit 1
+          fi
+          echo "Manifest updated to version ${{ env.VERSION }}"
 
       - name: Pipeline Summary
         if: always()
@@ -662,7 +710,10 @@ jobs:
   # ════════════════════════════════════════════════════════════
   consolidate_and_dojo_import:
     name: "🛡️ Consolidate Findings + DefectDojo Import"
-    runs-on: self-hosted
+    # Runner labels: self-hosted · Linux · X64
+    # Pinning all three prevents this job landing on a future
+    # runner with different OS/arch (e.g. an ARM box).
+    runs-on: [self-hosted, Linux, X64]
     needs:
       - secrets_scan
       - sast_scan
