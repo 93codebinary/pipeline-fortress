@@ -1,4 +1,4 @@
-name: "PipelineFortress — SAST + Secrets + SCA + Build + Image Scan + IaC + SBOM + DAST + Deploy"
+name: "PipelineFortress — SAST + Secrets + SCA + Build + Image Scan + IaC + SBOM + DAST + Push + Deploy"
 
 on:
   push:
@@ -6,8 +6,6 @@ on:
       - main
 
 env:
-  # VERSION is calculated inside build_push job after checkout
-  # Global env runs before checkout — version.txt not available yet
   DOCKERHUB_REPO: ${{ secrets.DOCKERHUB_USERNAME }}/gitops-juiceshop-devsecops
 
 jobs:
@@ -199,36 +197,26 @@ jobs:
 
 
   # ════════════════════════════════════════════════════════════
-  # JOB 4 — BUILD & PUSH DOCKER IMAGE
+  # JOB 4 — BUILD DOCKER IMAGE (LOCAL ONLY — NO PUSH)
+  #
+  # RESTRUCTURE: build and push are now SEPARATE jobs.
+  # This job only builds the image and saves it as a tar artifact.
+  # The tar is what image_scan / sbom / dast consume.
+  # Docker Hub push happens ONLY in Job 9 (push_image),
+  # which runs AFTER the DAST gate passes.
   # ════════════════════════════════════════════════════════════
-  build_push:
-    name: "🐳 Build & Push Docker Image"
+  build:
+    name: "🐳 Build Docker Image (no push)"
     runs-on: ubuntu-latest
     needs: [sast_scan, sca_scan]
 
     outputs:
-      # Expose VERSION as a job output so downstream jobs can reference it
-      # via needs.build_push.outputs.version
       version: ${{ steps.calc_version.outputs.version }}
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # ── VERSION FIX ────────────────────────────────────────────────────────
-      # ROOT CAUSE: version.txt contains "1.0" (float) not "1" (integer).
-      # bash $(( )) only accepts integers — "1.0 + 1" throws an error.
-      #
-      # FIX:
-      #   1. Read raw value  e.g. "1.0"
-      #   2. cut -d'.' -f1   strips decimal → "1"
-      #   3. Integer +1      → "2"
-      #   4. Write to GITHUB_ENV (runtime, post-checkout) AND outputs
-      #
-      # WHY NOT global env:
-      #   Global env is evaluated BEFORE checkout — version.txt doesn't exist.
-      #   GITHUB_ENV is evaluated at runtime AFTER checkout.
-      # ──────────────────────────────────────────────────────────────────────
       - name: Calculate next version
         id: calc_version
         run: |
@@ -241,18 +229,9 @@ jobs:
           echo "Stripped decimal      : $INT"
           echo "Next version          : $VERSION"
 
-      - name: Login to Docker Hub
-        run: |
-          echo "${{ secrets.DOCKERHUB_TOKEN }}" | \
-            docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
-
-      - name: Build Docker Image
+      - name: Build Docker Image (local only)
         run: |
           docker build -t docker.io/${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }} .
-
-      - name: Push Docker Image to Docker Hub
-        run: |
-          docker push docker.io/${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}
 
       - name: Save Docker Image as tar
         run: |
@@ -273,7 +252,7 @@ jobs:
   image_scan:
     name: "🛡️ Image Scan — Trivy"
     runs-on: ubuntu-latest
-    needs: build_push
+    needs: build
 
     steps:
       - name: Checkout Repository
@@ -315,8 +294,6 @@ jobs:
                   if v.get('Severity') == 'CRITICAL'
               )
               print(count)
-          except Exception:
-              print(0)
           ")
           echo "CRITICAL OS/runtime CVEs in image: $CRITICAL_COUNT"
           if [ "$CRITICAL_COUNT" -gt "0" ]; then
@@ -341,7 +318,7 @@ jobs:
   iac_scan:
     name: "🏗️ IaC Scan — Checkov"
     runs-on: ubuntu-latest
-    needs: build_push
+    needs: build
 
     steps:
       - name: Checkout Repository
@@ -406,7 +383,7 @@ jobs:
   sbom_generate:
     name: "📋 SBOM — Syft"
     runs-on: ubuntu-latest
-    needs: build_push
+    needs: build
 
     steps:
       - name: Checkout Repository
@@ -429,8 +406,7 @@ jobs:
 
       - name: Generate SBOM in JSON format
         run: |
-          # Try image reference first; fall back to tarball
-          syft docker.io/${{ env.DOCKERHUB_REPO }}:${{ needs.build_push.outputs.version }} \
+          syft docker.io/${{ env.DOCKERHUB_REPO }}:${{ needs.build.outputs.version }} \
             -o json > sbom.json 2>/dev/null \
             || syft juiceshop-image.tar -o json > sbom.json
           python3 -c "
@@ -445,8 +421,6 @@ jobs:
           syft juiceshop-image.tar -o spdx-json > sbom.spdx.json
 
       - name: Upload SBOM artifacts
-        # FIX: renamed from "sbom-reports" to "sbom-report" so it matches
-        # the "*-report" download pattern in Job 10
         uses: actions/upload-artifact@v4
         with:
           name: sbom-report
@@ -458,6 +432,8 @@ jobs:
 
   # ════════════════════════════════════════════════════════════
   # JOB 8 — DAST (OWASP ZAP Baseline)
+  # Runs against the LOCAL image loaded from tar — the image has
+  # still never been pushed to Docker Hub at this point.
   # ════════════════════════════════════════════════════════════
   dast_scan:
     name: "🕷️ DAST — OWASP ZAP Baseline"
@@ -535,9 +511,10 @@ jobs:
           echo "ZAP HIGH risk alerts: $HIGH_COUNT"
           if [ "$HIGH_COUNT" -gt "0" ]; then
             echo "DAST gate FAILED — $HIGH_COUNT HIGH risk alerts."
+            echo "Image will NOT be pushed to Docker Hub."
             exit 1
           fi
-          echo "DAST gate passed."
+          echo "DAST gate passed — image is cleared for Docker Hub push."
 
       - name: Stop DAST target container
         if: always()
@@ -555,12 +532,53 @@ jobs:
 
 
   # ════════════════════════════════════════════════════════════
-  # JOB 9 — DEPLOY & UPDATE MANIFESTS (GitOps Loop)
+  # JOB 9 — PUSH TO DOCKER HUB (ONLY AFTER DAST PASSES)
+  #
+  # NEW JOB. This is the ONLY place the image leaves the pipeline.
+  # It runs only if dast_scan succeeded, which in turn required
+  # image_scan + iac_scan + sbom_generate, which required
+  # build ← sast + sca ← secrets.
+  # So a push here means EVERY gate passed.
+  # ════════════════════════════════════════════════════════════
+  push_image:
+    name: "🚀 Push to Docker Hub (post-DAST)"
+    runs-on: ubuntu-latest
+    needs: [dast_scan, build]
+
+    outputs:
+      # Re-expose version so deploy job can consume it without recalculating
+      version: ${{ needs.build.outputs.version }}
+
+    steps:
+      - name: Download Docker Image tar artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image-tar
+          path: .
+
+      - name: Load Docker image from tar
+        run: docker load -i juiceshop-image.tar
+
+      - name: Login to Docker Hub
+        run: |
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | \
+            docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+      - name: Push verified image to Docker Hub
+        run: |
+          docker push docker.io/${{ env.DOCKERHUB_REPO }}:${{ needs.build.outputs.version }}
+          echo "Pushed docker.io/${{ env.DOCKERHUB_REPO }}:${{ needs.build.outputs.version }}"
+          echo "All security gates passed before this push:"
+          echo "  Secrets | SAST | SCA | Image | IaC | SBOM | DAST"
+
+
+  # ════════════════════════════════════════════════════════════
+  # JOB 10 — DEPLOY & UPDATE MANIFESTS (GitOps Loop)
   # ════════════════════════════════════════════════════════════
   deploy_and_update:
     name: "☸️ Deploy & Update Manifests"
     runs-on: ubuntu-latest
-    needs: dast_scan
+    needs: push_image
 
     permissions:
       contents: write
@@ -571,15 +589,10 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Each job runs on a fresh runner — GITHUB_ENV from Job 4 is gone.
-      # Recalculate version here exactly as in Job 4.
-      - name: Recalculate version
+      - name: Set version from push job output
         run: |
-          RAW=$(cat version.txt)
-          INT=$(echo "$RAW" | cut -d'.' -f1)
-          VERSION=$(( INT + 1 ))
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-          echo "Deploying version: $VERSION"
+          echo "VERSION=${{ needs.push_image.outputs.version }}" >> $GITHUB_ENV
+          echo "Deploying version: ${{ needs.push_image.outputs.version }}"
 
       - name: Set Git Config
         run: |
@@ -608,12 +621,13 @@ jobs:
           echo "  Branch : ${{ github.ref_name }}"
           echo "  Gates  : Secrets | SAST | SCA | Build"
           echo "           Image | IaC | SBOM | DAST"
+          echo "  Push   : AFTER DAST gate (verified image)"
           echo "  Status : All gates passed — ArgoCD syncing"
           echo "========================================"
 
 
   # ════════════════════════════════════════════════════════════
-  # JOB 10 — CONSOLIDATE FINDINGS + DEFECTDOJO IMPORT
+  # JOB 11 — CONSOLIDATE FINDINGS + DEFECTDOJO IMPORT
   # Runs on self-hosted runner (Kali) next to DefectDojo.
   # ════════════════════════════════════════════════════════════
   consolidate_and_dojo_import:
@@ -633,11 +647,6 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # FIX: pattern changed from "*-report" to "*-report*"
-      # Reason: sbom artifact was renamed to "sbom-report" (singular)
-      # to match this pattern. All artifacts now match:
-      #   gitleaks-report, semgrep-report, trivy-fs-report,
-      #   trivy-image-report, checkov-report, zap-dast-report, sbom-report
       - name: Download all scan artifacts
         uses: actions/download-artifact@v4
         with:
@@ -676,16 +685,6 @@ jobs:
           path: all-findings.json
           retention-days: 90
 
-      # ── DefectDojo Import ──────────────────────────────────────────────────
-      # DEFECTDOJO_URL    = http://localhost:8080
-      #   "localhost" resolves correctly here because this job runs on your
-      #   Kali machine (self-hosted runner), not on GitHub's cloud runners.
-      # DEFECTDOJO_API_KEY = API v2 key from DefectDojo → Settings → API
-      #
-      # auto_create_context=True:
-      #   Creates Product Type / Product / Engagement on first run.
-      #   Reuses them (matched by name) on every subsequent run.
-      # ──────────────────────────────────────────────────────────────────────
       - name: Import findings into DefectDojo
         env:
           DEFECTDOJO_URL:     ${{ secrets.DEFECTDOJO_URL }}
@@ -713,7 +712,6 @@ jobs:
           echo "=== DefectDojo response ==="
           python3 -m json.tool dojo-import-response.json || cat dojo-import-response.json
 
-          # Fail the step if DefectDojo returned an error
           if [[ "$HTTP_CODE" != "201" && "$HTTP_CODE" != "200" ]]; then
             echo "DefectDojo import FAILED — HTTP $HTTP_CODE"
             exit 1
@@ -730,7 +728,7 @@ jobs:
 
 
   # ════════════════════════════════════════════════════════════
-  # JOB 11 — LLM TRIAGE (NVIDIA NIM)
+  # JOB 12 — LLM TRIAGE (NVIDIA NIM)
   # ════════════════════════════════════════════════════════════
   llm_triage:
     name: "🤖 LLM Triage — NVIDIA NIM"
@@ -778,10 +776,10 @@ jobs:
             triage_report.json
             llm_raw.txt
           retention-days: 90
-          
+
 
   # ════════════════════════════════════════════════════════════
-  # JOB 12 — AUTO-FIX PR (Scenario A: fully automated)
+  # JOB 13 — AUTO-FIX PR (Scenario A: fully automated)
   # ════════════════════════════════════════════════════════════
   auto_fix_pr:
     name: "🔧 Auto-Fix PR — human must approve"
