@@ -1,0 +1,14 @@
+════════════════════════════════════════════════════════════
+# PipelineFortress — Trivy risk acceptance register
+# Each entry: CVE ID + reason + review date.
+# Applies to BOTH the fs scan (Job 3) and image scan (Job 5).
+# Unfixed CVEs are already suppressed via ignore-unfixed: true;
+# only FIXABLE, consciously accepted CVEs belong here.
+# ════════════════════════════════════════════════════════════
+
+# Example entries — replace with the actual CVE IDs from your
+# trivy-image-results.json that you decide to accept:
+
+# CVE-2023-37903   # vm2 sandbox escape — intentional Juice Shop vuln, tracked in DefectDojo (review 2026-10-20)
+# CVE-2023-32314   # vm2 — same as above (review 2026-10-20)
+# CVE-2019-10744   # lodash prototype pollution — required by Juice Shop challenge (review 2026-10-20)
