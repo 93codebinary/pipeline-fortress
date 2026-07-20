@@ -4,8 +4,6 @@
 
 # 🛡️ PipelineFortress
 
-### *Nothing unverified reaches the registry.*
-
 **A production-grade DevSecOps pipeline — 8 security gates, consolidated vulnerability management, and AI-assisted triage with a human in the loop.**
 
 <br>
