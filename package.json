@@ -129,7 +129,6 @@
     "html-entities": "^1.4.0",
     "i18n": "^0.11.1",
     "js-yaml": "^3.14.0",
-    /*"jsonwebtoken": "0.4.0"*/,
     "jsonwebtoken": "9.0.2",
     "libxml2-wasm": "^0.7.1",
     "marsdb": "^0.6.11",
@@ -180,7 +179,6 @@
     "@types/graceful-fs": "^4.1.9",
     "@types/i18n": "^0.12.0",
     "@types/js-yaml": "^3.12.10",
-    /*"@types/jsonwebtoken": "^8.5.9"*/
     "@types/jsonwebtoken": "^9.0.2",
     "@types/jws": "^3.2.10",
     "@types/lodash": "^4.17.14",
