@@ -9,14 +9,13 @@ env:
   DOCKERHUB_REPO: ${{ secrets.DOCKERHUB_USERNAME }}/gitops-juiceshop-devsecops
 
 # ════════════════════════════════════════════════════════════
-# CONCURRENCY — prevents two runs on the same branch racing to
-# bump version.txt. Without this, two runs read the same
-# version.txt, compute the same VERSION, and the second one
-# finds nothing to commit and fails.
+# CONCURRENCY — serialises runs on the same branch so two
+# deployments never fight over the container name or port 80
+# on the self-hosted runner.
 #
 # cancel-in-progress: false is deliberate — never cancel a run
-# that may have already pushed an image but not yet updated
-# the manifest.
+# that may have already pushed an image but not yet completed
+# its deployment.
 # ════════════════════════════════════════════════════════════
 concurrency:
   group: pipelinefortress-${{ github.ref }}
@@ -244,17 +243,34 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Calculate next version
+      # ── VERSIONING ────────────────────────────────────────────
+      # CHANGED because the GitOps job that used to write version.txt
+      # back to the repo has been removed.
+      #
+      # Reading version.txt now would produce the SAME version on
+      # every run — each build would overwrite the previous Docker
+      # Hub tag and you would lose version history entirely.
+      #
+      # github.run_number is monotonic, unique per run, and requires
+      # no shared mutable state. It also removes the race condition
+      # that previously made two concurrent runs collide.
+      #
+      # To go back to the file-based counter, restore the GitOps job
+      # and swap this step for the commented block below.
+      # ──────────────────────────────────────────────────────────
+      - name: Calculate version
         id: calc_version
         run: |
-          RAW=$(cat version.txt)
-          INT=$(echo "$RAW" | cut -d'.' -f1)
-          VERSION=$(( INT + 1 ))
-          echo "VERSION=$VERSION"      >> $GITHUB_ENV
-          echo "version=$VERSION"      >> $GITHUB_OUTPUT
-          echo "version.txt raw value : $RAW"
-          echo "Stripped decimal      : $INT"
-          echo "Next version          : $VERSION"
+          VERSION="${{ github.run_number }}"
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Build version : $VERSION  (github.run_number)"
+          echo "Commit        : ${{ github.sha }}"
+
+          # Previous file-based scheme, kept for reference:
+          #   RAW=$(cat version.txt)
+          #   INT=$(echo "$RAW" | cut -d'.' -f1)
+          #   VERSION=$(( INT + 1 ))
 
       - name: Build Docker Image (local only)
         run: |
@@ -476,12 +492,12 @@ jobs:
 
 
   # ════════════════════════════════════════════════════════════
-  # JOB 8 — DAST (OWASP ZAP Baseline)
+  # JOB 8 — DAST (OWASP ZAP FULL ACTIVE SCAN)
   # Runs against the LOCAL image loaded from tar — the image has
   # still never been pushed to Docker Hub at this point.
   # ════════════════════════════════════════════════════════════
   dast_scan:
-    name: "🕷️ DAST — OWASP ZAP Baseline"
+    name: "🕷️ DAST — OWASP ZAP Full Active Scan"
     runs-on: ubuntu-latest
     needs: [image_scan, iac_scan, sbom_generate]
 
@@ -518,18 +534,57 @@ jobs:
             sleep 5
           done
 
-      - name: Run OWASP ZAP Baseline DAST scan
+      # ── ADVANCED DAST — FULL ACTIVE SCAN ──────────────────────
+      # zap-full-scan.py replaces zap-baseline.py.
+      #
+      # baseline = passive only. It spiders the app and inspects
+      #            responses. Never sends an attack payload.
+      #            Finds missing headers, cookie flags, info leaks.
+      #
+      # full     = passive + ACTIVE attack. Sends real SQLi, XSS,
+      #            path traversal, command injection, and XXE
+      #            payloads against every discovered parameter.
+      #            This is what finds exploitable vulnerabilities.
+      #
+      # FLAGS:
+      #   -j        AJAX spider — required for Juice Shop, which is
+      #             an Angular SPA. The traditional spider only sees
+      #             the initial HTML and misses nearly every route.
+      #   -m 10     spend up to 10 minutes spidering before attacking
+      #   -T 90     hard ceiling of 90 minutes for the whole scan
+      #   -I        do not let ZAP's own exit code fail the step —
+      #             our Python gate below decides pass/fail
+      #   -z ...    raise attack strength and lower the alert
+      #             threshold so lower-confidence findings surface
+      #
+      # RUNTIME: expect 30–90 minutes, versus ~5 for baseline.
+      # Well inside the 6-hour GitHub Actions job limit.
+      # ──────────────────────────────────────────────────────────
+      - name: Run OWASP ZAP Full Active DAST scan
+        timeout-minutes: 120
         run: |
           docker run --rm \
             --network host \
             -v $(pwd):/zap/wrk/:rw \
             ghcr.io/zaproxy/zaproxy:stable \
-            zap-baseline.py \
+            zap-full-scan.py \
             -t http://localhost:3000 \
             -r zap-report.html \
             -J zap-report.json \
+            -j \
+            -m 10 \
+            -T 90 \
             -I \
+            -z "-config scanner.attackStrength=HIGH \
+                -config scanner.alertThreshold=LOW \
+                -config spider.maxDuration=10" \
             || true
+
+      - name: Fix ZAP report ownership
+        if: always()
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" . 2>/dev/null || true
+          ls -lh zap-report.* 2>/dev/null || echo "no ZAP reports produced"
 
       - name: Ensure ZAP output exists
         run: |
@@ -617,91 +672,153 @@ jobs:
 
 
   # ════════════════════════════════════════════════════════════
-  # JOB 10 — DEPLOY & UPDATE MANIFESTS (GitOps Loop)
+  # JOB 10 — VERIFIED IMAGE DEPLOYMENT (local self-hosted runner)
+  #
+  # Runs the gate-passed image on the Kali runner — the SAME
+  # machine that hosts DefectDojo.
+  #
+  # Loads the tar artifact rather than pulling from Docker Hub,
+  # so the running container is byte-identical to what was
+  # scanned. No registry round trip.
+  #
+  # PORT MAP on the Kali box:
+  #   80    juiceshop-app     ← this job
+  #   8080  DefectDojo
+  #
+  # PORT 80 NOTE: the Docker daemon runs as root, so binding 80
+  # works even though the runner user is unprivileged. But 80 is
+  # commonly claimed by apache2/nginx on Kali — the pre-flight
+  # check below fails loudly rather than silently producing a
+  # broken deployment.
   # ════════════════════════════════════════════════════════════
-  deploy_and_update:
-    name: "☸️ Deploy & Update Manifests"
-    runs-on: ubuntu-latest
-    needs: push_image
+  verified_image_deployment:
+    name: "🖥️ Verified Image Deployment"
+    runs-on: [self-hosted, Linux, X64]
+    needs: [push_image, build]
 
-    permissions:
-      contents: write
+    env:
+      APP_CONTAINER: juiceshop-app
+      APP_PORT: 80
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set version from push job output
+      - name: Resolve image reference
         run: |
-          echo "VERSION=${{ needs.push_image.outputs.version }}" >> $GITHUB_ENV
-          echo "Deploying version: ${{ needs.push_image.outputs.version }}"
+          IMAGE="docker.io/${{ env.DOCKERHUB_REPO }}:${{ needs.build.outputs.version }}"
+          echo "APP_IMAGE=$IMAGE" >> $GITHUB_ENV
+          echo "Verified image to deploy: $IMAGE"
 
-      - name: Set Git Config
+      - name: Show what is currently running
         run: |
-          git config --global user.email "${{ secrets.GIT_EMAIL }}"
-          git config --global user.name "${{ secrets.GIT_USERNAME }}"
+          echo "=== Containers on this runner ==="
+          docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
 
-      # ── IDEMPOTENT GITOPS COMMIT ──────────────────────────────
-      # A GitOps reconciler that finds the desired state already
-      # present has SUCCEEDED, not failed. Previously `git commit`
-      # exited 1 on "nothing to commit" and failed the job.
-      #
-      # Also retries the push: a commit can land between our pull
-      # and our push, and losing that race should not fail a run
-      # that already published a verified image.
-      # ──────────────────────────────────────────────────────────
-      - name: Update deployment.yaml and version.txt
+      - name: Pre-flight — check port ${{ env.APP_PORT }}
         run: |
-          git pull --rebase
-
-          sed -i \
-            "s|image: .*/gitops-juiceshop-devsecops:.*|image: ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}|" \
-            deployment.yaml
-          echo "${{ env.VERSION }}" > version.txt
-
-          git add deployment.yaml version.txt
-
-          if git diff --staged --quiet; then
-            echo "::notice::Manifests already at version ${{ env.VERSION }} — nothing to commit."
-            echo "GitOps state already correct. Exiting successfully."
-            exit 0
-          fi
-
-          git commit -m "ci: update image to ${{ env.VERSION }} — all security gates passed"
-
-          PUSHED=0
-          for i in 1 2 3; do
-            if git push; then
-              PUSHED=1
-              break
-            fi
-            echo "Push rejected — rebasing and retrying ($i/3)"
-            git pull --rebase || true
-            sleep 3
-          done
-
-          if [ "$PUSHED" != "1" ]; then
-            echo "Push failed after 3 attempts."
+          # Another CONTAINER holding port 80?
+          IN_USE=$(docker ps --filter "publish=${{ env.APP_PORT }}" \
+            --format '{{.Names}}' | grep -v "^${{ env.APP_CONTAINER }}$" || true)
+          if [ -n "$IN_USE" ]; then
+            echo "Port ${{ env.APP_PORT }} is held by container: $IN_USE"
+            echo "Refusing to continue — this is not our container."
             exit 1
           fi
-          echo "Manifest updated to version ${{ env.VERSION }}"
 
-      - name: Pipeline Summary
+          # A HOST service (apache2 / nginx) holding port 80?
+          if ss -ltn 2>/dev/null | grep -q ':80 '; then
+            if ! docker ps --filter "name=${{ env.APP_CONTAINER }}" -q | grep -q .; then
+              echo "Port 80 is bound by a host process:"
+              ss -ltnp 2>/dev/null | grep ':80 ' || true
+              echo ""
+              echo "Kali ships apache2. Stop it with:"
+              echo "  sudo systemctl stop apache2 && sudo systemctl disable apache2"
+              exit 1
+            fi
+          fi
+          echo "Port ${{ env.APP_PORT }} is available."
+
+      - name: Remove previous deployment
+        run: |
+          if docker ps -a --format '{{.Names}}' | grep -qx "${{ env.APP_CONTAINER }}"; then
+            PREV=$(docker inspect --format '{{.Config.Image}}' \
+              "${{ env.APP_CONTAINER }}" 2>/dev/null || echo unknown)
+            echo "Replacing previous deployment: $PREV"
+            docker rm -f "${{ env.APP_CONTAINER }}"
+          else
+            echo "No previous container — first deployment on this runner."
+          fi
+
+      - name: Download verified image tar
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image-tar
+          path: .
+
+      - name: Load image and start container
+        run: |
+          docker load -i juiceshop-image.tar
+
+          docker run -d \
+            --name "${{ env.APP_CONTAINER }}" \
+            --restart unless-stopped \
+            -p ${{ env.APP_PORT }}:3000 \
+            --memory 1g \
+            --cpus 1.0 \
+            --label pipelinefortress.managed=true \
+            --label pipelinefortress.version=${{ needs.build.outputs.version }} \
+            --label pipelinefortress.commit=${{ github.sha }} \
+            "${{ env.APP_IMAGE }}"
+
+          echo "Container started."
+
+      - name: Health check
+        run: |
+          echo "Polling http://localhost:${{ env.APP_PORT }} ..."
+          READY=0
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              "http://localhost:${{ env.APP_PORT }}" || echo "000")
+            if [ "$CODE" = "200" ]; then
+              echo "Healthy — HTTP $CODE after $i attempt(s)"
+              READY=1
+              break
+            fi
+            echo "  attempt $i — HTTP $CODE — retrying in 5s"
+            sleep 5
+          done
+
+          if [ "$READY" != "1" ]; then
+            echo "Application failed to become healthy within 150s."
+            echo "=== Last 50 log lines ==="
+            docker logs --tail 50 "${{ env.APP_CONTAINER }}" 2>&1 || true
+            docker rm -f "${{ env.APP_CONTAINER }}" || true
+            exit 1
+          fi
+
+      - name: Housekeeping — reclaim disk on the runner
         if: always()
         run: |
-          echo "========================================"
-          echo "  PIPELINEFORTRESS — RUN COMPLETE"
-          echo "========================================"
-          echo "  Image  : ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}"
-          echo "  Commit : ${{ github.sha }}"
-          echo "  Branch : ${{ github.ref_name }}"
-          echo "  Gates  : Secrets | SAST | SCA | Build"
-          echo "           Image | IaC | SBOM | DAST"
-          echo "  Push   : AFTER DAST gate (verified image)"
-          echo "  Status : All gates passed — ArgoCD syncing"
-          echo "========================================"
+          rm -f juiceshop-image.tar
+          docker image prune -f || true
+          echo "Disk free: $(df -h / | tail -1 | awk '{print $4}')"
+
+      - name: Deployment summary
+        run: |
+          RUNNER_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+          echo "==========================================="
+          echo "  VERIFIED IMAGE DEPLOYMENT — COMPLETE"
+          echo "==========================================="
+          echo "  Image      : ${{ env.APP_IMAGE }}"
+          echo "  Container  : ${{ env.APP_CONTAINER }}"
+          echo "  App URL    : http://localhost"
+          echo "  LAN URL    : http://${RUNNER_IP}"
+          echo "  DefectDojo : http://localhost:8080  (same machine)"
+          echo "  Restart    : unless-stopped"
+          echo "  Source     : tar artifact — never pulled from registry"
+          echo "  Gates      : Secrets | SAST | SCA | Image"
+          echo "               IaC | SBOM | DAST — all passed"
+          echo "==========================================="
+          docker ps --filter "name=${{ env.APP_CONTAINER }}" \
+            --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
 
 
   # ════════════════════════════════════════════════════════════
