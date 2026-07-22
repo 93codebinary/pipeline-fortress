@@ -8,8 +8,7 @@ PipelineFortress wraps **OWASP Juice Shop** — an intentionally vulnerable web 
 
 ## Supported Versions
 
-Security patches are provided for the latest released version of the pipeline.
-
+Security patches are provided for the latest released version of the pipeline
 | Version | Supported |
 |:--------|:----------|
 | Latest (master) | ✅ |
