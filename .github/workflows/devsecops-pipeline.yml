@@ -672,79 +672,89 @@ jobs:
 
 
   # ════════════════════════════════════════════════════════════
-  # JOB 10 — VERIFIED IMAGE DEPLOYMENT (local self-hosted runner)
+  # JOB 10 — VERIFIED IMAGE DEPLOYMENT BEHIND BUNKERWEB WAF
   #
-  # Runs the gate-passed image on the Kali runner — the SAME
-  # machine that hosts DefectDojo.
+  # Deploys the gate-passed image on the self-hosted runner, but
+  # NOT directly on port 80. Instead:
   #
-  # Loads the tar artifact rather than pulling from Docker Hub,
-  # so the running container is byte-identical to what was
-  # scanned. No registry round trip.
+  #   Internet ─► BunkerWeb :80/:443 ─► juiceshop-app :3000
+  #                  (WAF, CRS)          (internal network only)
   #
-  # PORT MAP on the Kali box:
-  #   80    juiceshop-app     ← this job
-  #   8080  DefectDojo
+  # KEY DIFFERENCE from a direct deployment:
+  #   • BunkerWeb owns host ports 80 and 443.
+  #   • juiceshop-app publishes NO host port. It is reachable
+  #     ONLY through the WAF, by container name, over a private
+  #     Docker network (bw-net).
+  #   • Every request is inspected by ModSecurity + OWASP CRS
+  #     before it ever touches the app.
   #
-  # PORT 80 NOTE: the Docker daemon runs as root, so binding 80
-  # works even though the runner user is unprivileged. But 80 is
-  # commonly claimed by apache2/nginx on Kali — the pre-flight
-  # check below fails loudly rather than silently producing a
-  # broken deployment.
+  # WAF STARTS IN DETECTION MODE (MODSECURITY_SEC_RULE_ENGINE:
+  # DetectionOnly). CRS in blocking mode breaks an Angular SPA
+  # with false positives on day one. Observe → tune → then set
+  # this to "on". Same Count→Block promotion as a cloud WAF.
+  #
+  # PORT MAP on the runner:
+  #   80/443  bunkerweb-aio   ← WAF, the only public entrypoint
+  #   3000    juiceshop-app   ← internal to bw-net, NOT published
+  #   8080    DefectDojo
   # ════════════════════════════════════════════════════════════
   verified_image_deployment:
-    name: "🖥️ Verified Image Deployment"
+    name: "🛡️ Verified Image Deployment (behind BunkerWeb WAF)"
     runs-on: [self-hosted, Linux, X64]
     needs: [push_image, build]
 
     env:
       APP_CONTAINER: juiceshop-app
-      APP_PORT: 80
+      WAF_CONTAINER: bunkerweb-aio
+      BW_NETWORK:    bw-net
+      APP_INTERNAL_PORT: 3000        # Juice Shop listens here, inside bw-net
+      WAF_HTTP_PORT:  80
+      WAF_HTTPS_PORT: 443
+      BUNKERWEB_IMAGE: bunkerity/bunkerweb-all-in-one:1.6.12
 
     steps:
       - name: Resolve image reference
         run: |
           IMAGE="docker.io/${{ env.DOCKERHUB_REPO }}:${{ needs.build.outputs.version }}"
           echo "APP_IMAGE=$IMAGE" >> $GITHUB_ENV
-          echo "Verified image to deploy: $IMAGE"
+          echo "Verified image to deploy behind WAF: $IMAGE"
 
       - name: Show what is currently running
         run: |
           echo "=== Containers on this runner ==="
           docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
 
-      - name: Pre-flight — check port ${{ env.APP_PORT }}
+      - name: Pre-flight — port 80 must be free for BunkerWeb
         run: |
-          # Another CONTAINER holding port 80?
-          IN_USE=$(docker ps --filter "publish=${{ env.APP_PORT }}" \
-            --format '{{.Names}}' | grep -v "^${{ env.APP_CONTAINER }}$" || true)
+          # Another CONTAINER (not our WAF) holding 80?
+          IN_USE=$(docker ps --filter "publish=${{ env.WAF_HTTP_PORT }}" \
+            --format '{{.Names}}' | grep -v "^${{ env.WAF_CONTAINER }}$" || true)
           if [ -n "$IN_USE" ]; then
-            echo "Port ${{ env.APP_PORT }} is held by container: $IN_USE"
-            echo "Refusing to continue — this is not our container."
+            echo "Port 80 is held by container: $IN_USE"
+            echo "That is not the WAF — refusing to continue."
             exit 1
           fi
 
-          # A HOST service (apache2 / nginx) holding port 80?
+          # A HOST service (apache2 / nginx) on 80?
           if ss -ltn 2>/dev/null | grep -q ':80 '; then
-            if ! docker ps --filter "name=${{ env.APP_CONTAINER }}" -q | grep -q .; then
+            if ! docker ps --filter "name=${{ env.WAF_CONTAINER }}" -q | grep -q .; then
               echo "Port 80 is bound by a host process:"
               ss -ltnp 2>/dev/null | grep ':80 ' || true
               echo ""
-              echo "Kali ships apache2. Stop it with:"
+              echo "Free it (Kali ships apache2):"
               echo "  sudo systemctl stop apache2 && sudo systemctl disable apache2"
               exit 1
             fi
           fi
-          echo "Port ${{ env.APP_PORT }} is available."
+          echo "Port 80 is available for BunkerWeb."
 
-      - name: Remove previous deployment
+      - name: Ensure private WAF network exists
         run: |
-          if docker ps -a --format '{{.Names}}' | grep -qx "${{ env.APP_CONTAINER }}"; then
-            PREV=$(docker inspect --format '{{.Config.Image}}' \
-              "${{ env.APP_CONTAINER }}" 2>/dev/null || echo unknown)
-            echo "Replacing previous deployment: $PREV"
-            docker rm -f "${{ env.APP_CONTAINER }}"
+          if ! docker network inspect "${{ env.BW_NETWORK }}" >/dev/null 2>&1; then
+            docker network create "${{ env.BW_NETWORK }}"
+            echo "Created network ${{ env.BW_NETWORK }}"
           else
-            echo "No previous container — first deployment on this runner."
+            echo "Network ${{ env.BW_NETWORK }} already exists."
           fi
 
       - name: Download verified image tar
@@ -753,14 +763,18 @@ jobs:
           name: docker-image-tar
           path: .
 
-      - name: Load image and start container
+      - name: Load verified image
+        run: docker load -i juiceshop-image.tar
+
+      # ── APP: internal only, NO host port ──────────────────────
+      - name: (Re)deploy Juice Shop on the private network
         run: |
-          docker load -i juiceshop-image.tar
+          docker rm -f "${{ env.APP_CONTAINER }}" 2>/dev/null || true
 
           docker run -d \
             --name "${{ env.APP_CONTAINER }}" \
             --restart unless-stopped \
-            -p ${{ env.APP_PORT }}:3000 \
+            --network "${{ env.BW_NETWORK }}" \
             --memory 1g \
             --cpus 1.0 \
             --label pipelinefortress.managed=true \
@@ -768,30 +782,79 @@ jobs:
             --label pipelinefortress.commit=${{ github.sha }} \
             "${{ env.APP_IMAGE }}"
 
-          echo "Container started."
+          echo "Juice Shop started on ${{ env.BW_NETWORK }} — no host port published."
 
-      - name: Health check
+      # ── WAF: owns 80/443, proxies to the app by name ──────────
+      - name: (Re)deploy BunkerWeb in front of the app
         run: |
-          echo "Polling http://localhost:${{ env.APP_PORT }} ..."
+          docker rm -f "${{ env.WAF_CONTAINER }}" 2>/dev/null || true
+
+          RUNNER_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+
+          docker run -d \
+            --name "${{ env.WAF_CONTAINER }}" \
+            --restart unless-stopped \
+            --network "${{ env.BW_NETWORK }}" \
+            -p ${{ env.WAF_HTTP_PORT }}:8080/tcp \
+            -p ${{ env.WAF_HTTPS_PORT }}:8443/tcp \
+            -p ${{ env.WAF_HTTPS_PORT }}:8443/udp \
+            -v bw-storage:/data \
+            -e SERVER_NAME="${RUNNER_IP}" \
+            -e USE_REVERSE_PROXY="yes" \
+            -e REVERSE_PROXY_URL="/" \
+            -e REVERSE_PROXY_HOST="http://${{ env.APP_CONTAINER }}:${{ env.APP_INTERNAL_PORT }}" \
+            -e USE_MODSECURITY="yes" \
+            -e USE_MODSECURITY_CRS="yes" \
+            -e MODSECURITY_SEC_RULE_ENGINE="DetectionOnly" \
+            -e DISABLE_DEFAULT_SERVER="yes" \
+            -e ALLOWED_METHODS="GET|POST|HEAD|PUT|DELETE|OPTIONS" \
+            -e X_FRAME_OPTIONS="SAMEORIGIN" \
+            -e USE_GZIP="yes" \
+            -e USE_LIMIT_REQ="yes" \
+            -e LIMIT_REQ_URL_1="/rest/user/login" \
+            -e LIMIT_REQ_RATE_1="5r/s" \
+            -e AUTO_LETS_ENCRYPT="no" \
+            -e GENERATE_SELF_SIGNED_SSL="yes" \
+            "${{ env.BUNKERWEB_IMAGE }}"
+
+          echo "BunkerWeb started — WAF now fronting ${{ env.APP_CONTAINER }}."
+
+      - name: Health check through the WAF
+        run: |
+          echo "Polling http://localhost:${{ env.WAF_HTTP_PORT }} (through BunkerWeb) ..."
           READY=0
-          for i in $(seq 1 30); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-              "http://localhost:${{ env.APP_PORT }}" || echo "000")
-            if [ "$CODE" = "200" ]; then
-              echo "Healthy — HTTP $CODE after $i attempt(s)"
-              READY=1
-              break
-            fi
-            echo "  attempt $i — HTTP $CODE — retrying in 5s"
-            sleep 5
+          # BunkerWeb + app cold start is slower than a bare container
+          for i in $(seq 1 40); do
+            CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
+              "http://localhost:${{ env.WAF_HTTP_PORT }}" || echo "000")
+            # 200 = through to app. 302/403 can also mean WAF is up and
+            # responding (redirect to HTTPS, or CRS challenge) — treat
+            # any non-000/502/504 as "WAF is alive".
+            case "$CODE" in
+              200) echo "Healthy through WAF — HTTP 200 after $i attempt(s)"; READY=1; break;;
+              000|502|503|504) echo "  attempt $i — HTTP $CODE — upstream not ready, retry 5s"; sleep 5;;
+              *)   echo "  attempt $i — HTTP $CODE — WAF responding; confirming app path"; sleep 5;;
+            esac
           done
 
           if [ "$READY" != "1" ]; then
-            echo "Application failed to become healthy within 150s."
-            echo "=== Last 50 log lines ==="
-            docker logs --tail 50 "${{ env.APP_CONTAINER }}" 2>&1 || true
-            docker rm -f "${{ env.APP_CONTAINER }}" || true
+            echo "App did not become reachable through the WAF within ~200s."
+            echo "=== BunkerWeb logs (last 40) ==="
+            docker logs --tail 40 "${{ env.WAF_CONTAINER }}" 2>&1 || true
+            echo "=== Juice Shop logs (last 40) ==="
+            docker logs --tail 40 "${{ env.APP_CONTAINER }}" 2>&1 || true
             exit 1
+          fi
+
+      - name: Confirm the app is NOT directly exposed
+        run: |
+          # Juice Shop must NOT answer on 3000 from the host — only via WAF.
+          DIRECT=$(curl -s -o /dev/null -w "%{http_code}" \
+            "http://localhost:${{ env.APP_INTERNAL_PORT }}" || echo "000")
+          if [ "$DIRECT" = "200" ]; then
+            echo "::warning::App is reachable directly on :${{ env.APP_INTERNAL_PORT }} — WAF can be bypassed. Check no stray -p publish exists."
+          else
+            echo "Good — app is not directly reachable on :${{ env.APP_INTERNAL_PORT }} (HTTP $DIRECT). WAF is the only entrypoint."
           fi
 
       - name: Housekeeping — reclaim disk on the runner
@@ -804,21 +867,28 @@ jobs:
       - name: Deployment summary
         run: |
           RUNNER_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-          echo "==========================================="
-          echo "  VERIFIED IMAGE DEPLOYMENT — COMPLETE"
-          echo "==========================================="
+          echo "==========================================================="
+          echo "  VERIFIED IMAGE DEPLOYMENT — BEHIND BUNKERWEB WAF"
+          echo "==========================================================="
+          echo "  Flow       : client → BunkerWeb(:80/:443) → juiceshop-app(:3000)"
           echo "  Image      : ${{ env.APP_IMAGE }}"
-          echo "  Container  : ${{ env.APP_CONTAINER }}"
-          echo "  App URL    : http://localhost"
-          echo "  LAN URL    : http://${RUNNER_IP}"
-          echo "  DefectDojo : http://localhost:8080  (same machine)"
-          echo "  Restart    : unless-stopped"
-          echo "  Source     : tar artifact — never pulled from registry"
-          echo "  Gates      : Secrets | SAST | SCA | Image"
-          echo "               IaC | SBOM | DAST — all passed"
-          echo "==========================================="
-          docker ps --filter "name=${{ env.APP_CONTAINER }}" \
+          echo "  WAF        : ${{ env.WAF_CONTAINER }}  (ModSecurity + OWASP CRS)"
+          echo "  WAF mode   : DetectionOnly  (tune, then set to 'on')"
+          echo "  App access : ONLY via WAF — no host port on the app"
+          echo "  HTTP URL   : http://${RUNNER_IP}"
+          echo "  HTTPS URL  : https://${RUNNER_IP}   (self-signed)"
+          echo "  DefectDojo : http://localhost:8080"
+          echo "  Gates      : Secrets | SAST | SCA | Image | IaC | SBOM | DAST"
+          echo "==========================================================="
+          docker ps --filter "name=${{ env.WAF_CONTAINER }}" \
+                    --filter "name=${{ env.APP_CONTAINER }}" \
             --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+
+          echo ""
+          echo "Watch what CRS would block (still in DetectionOnly):"
+          echo "  docker logs -f ${{ env.WAF_CONTAINER }} | grep -i modsecurity"
+          echo "When tuned, promote to blocking:"
+          echo "  re-run with MODSECURITY_SEC_RULE_ENGINE=on"
 
 
   # ════════════════════════════════════════════════════════════
