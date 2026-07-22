@@ -711,6 +711,13 @@ jobs:
       WAF_HTTP_PORT:  80
       WAF_HTTPS_PORT: 443
       BUNKERWEB_IMAGE: bunkerity/bunkerweb-all-in-one:1.6.12
+      # ── WebUI (control plane) ───────────────────────────────
+      # Served THROUGH BunkerWeb on an unguessable path — NOT on
+      # its own public port. Auth + secret path + HTTPS + (opt)
+      # IP allowlist. Set the two secrets in the repo:
+      #   BUNKERWEB_UI_USERNAME, BUNKERWEB_UI_PASSWORD
+      # and optionally BUNKERWEB_UI_PATH (default below).
+      UI_PATH: ${{ secrets.BUNKERWEB_UI_PATH || 'admin-7f3c9e21' }}
 
     steps:
       - name: Resolve image reference
@@ -784,12 +791,36 @@ jobs:
 
           echo "Juice Shop started on ${{ env.BW_NETWORK }} — no host port published."
 
-      # ── WAF: owns 80/443, proxies to the app by name ──────────
-      - name: (Re)deploy BunkerWeb in front of the app
+      # ── WAF + WebUI ───────────────────────────────────────────
+      # BunkerWeb owns 80/443. Two things served through it:
+      #   https://<host>/                → Juice Shop (via WAF)
+      #   https://<host>/<UI_PATH>/      → BunkerWeb WebUI login
+      #
+      # MULTISITE=yes is REQUIRED: the SERVER_NAME-prefixed vars
+      # (…_USE_TEMPLATE=ui etc.) are how the UI gets reverse-proxied
+      # on the secret path. SERVICE_UI=yes turns the UI on; port
+      # 7000 is NOT published — the docs mark direct 7000 exposure
+      # as not for production.
+      #
+      # Fails early if the UI credentials secrets are missing, so
+      # you never boot an admin panel with blank/default creds.
+      # ──────────────────────────────────────────────────────────
+      - name: (Re)deploy BunkerWeb + WebUI in front of the app
+        env:
+          UI_USER: ${{ secrets.BUNKERWEB_UI_USERNAME }}
+          UI_PASS: ${{ secrets.BUNKERWEB_UI_PASSWORD }}
         run: |
+          if [ -z "$UI_USER" ] || [ -z "$UI_PASS" ]; then
+            echo "::error::BUNKERWEB_UI_USERNAME / BUNKERWEB_UI_PASSWORD secrets are not set."
+            echo "Add them in repo Settings → Secrets → Actions before enabling the UI."
+            exit 1
+          fi
+
           docker rm -f "${{ env.WAF_CONTAINER }}" 2>/dev/null || true
 
           RUNNER_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+          SN="$RUNNER_IP"                    # SERVER_NAME = the box IP
+          UIP="${{ env.UI_PATH }}"           # unguessable admin path
 
           docker run -d \
             --name "${{ env.WAF_CONTAINER }}" \
@@ -799,25 +830,42 @@ jobs:
             -p ${{ env.WAF_HTTPS_PORT }}:8443/tcp \
             -p ${{ env.WAF_HTTPS_PORT }}:8443/udp \
             -v bw-storage:/data \
-            -e SERVER_NAME="${RUNNER_IP}" \
+            -e SERVER_NAME="$SN" \
+            -e MULTISITE="yes" \
+            -e DISABLE_DEFAULT_SERVER="yes" \
+            \
             -e USE_REVERSE_PROXY="yes" \
             -e REVERSE_PROXY_URL="/" \
             -e REVERSE_PROXY_HOST="http://${{ env.APP_CONTAINER }}:${{ env.APP_INTERNAL_PORT }}" \
+            \
+            -e SERVICE_UI="yes" \
+            -e UI_WIZARD="no" \
+            -e ADMIN_USERNAME="$UI_USER" \
+            -e ADMIN_PASSWORD="$UI_PASS" \
+            -e "${SN}_USE_TEMPLATE=ui" \
+            -e "${SN}_USE_REVERSE_PROXY=yes" \
+            -e "${SN}_REVERSE_PROXY_URL=/${UIP}/" \
+            -e "${SN}_REVERSE_PROXY_HOST=http://127.0.0.1:7000" \
+            -e "${SN}_REVERSE_PROXY_HEADERS=X-Script-Name /${UIP}" \
+            -e "${SN}_REVERSE_PROXY_INTERCEPT_ERRORS=no" \
+            \
             -e USE_MODSECURITY="yes" \
             -e USE_MODSECURITY_CRS="yes" \
             -e MODSECURITY_SEC_RULE_ENGINE="DetectionOnly" \
-            -e DISABLE_DEFAULT_SERVER="yes" \
             -e ALLOWED_METHODS="GET|POST|HEAD|PUT|DELETE|OPTIONS" \
             -e X_FRAME_OPTIONS="SAMEORIGIN" \
             -e USE_GZIP="yes" \
             -e USE_LIMIT_REQ="yes" \
             -e LIMIT_REQ_URL_1="/rest/user/login" \
             -e LIMIT_REQ_RATE_1="5r/s" \
+            \
             -e AUTO_LETS_ENCRYPT="no" \
             -e GENERATE_SELF_SIGNED_SSL="yes" \
             "${{ env.BUNKERWEB_IMAGE }}"
 
-          echo "BunkerWeb started — WAF now fronting ${{ env.APP_CONTAINER }}."
+          echo "BunkerWeb + WebUI started."
+          echo "  App : https://$SN/"
+          echo "  UI  : https://$SN/${UIP}/"
 
       - name: Health check through the WAF
         run: |
@@ -875,8 +923,8 @@ jobs:
           echo "  WAF        : ${{ env.WAF_CONTAINER }}  (ModSecurity + OWASP CRS)"
           echo "  WAF mode   : DetectionOnly  (tune, then set to 'on')"
           echo "  App access : ONLY via WAF — no host port on the app"
-          echo "  HTTP URL   : http://${RUNNER_IP}"
-          echo "  HTTPS URL  : https://${RUNNER_IP}   (self-signed)"
+          echo "  App URL    : https://${RUNNER_IP}/           (self-signed)"
+          echo "  WebUI URL  : https://${RUNNER_IP}/${{ env.UI_PATH }}/  (login)"
           echo "  DefectDojo : http://localhost:8080"
           echo "  Gates      : Secrets | SAST | SCA | Image | IaC | SBOM | DAST"
           echo "==========================================================="
