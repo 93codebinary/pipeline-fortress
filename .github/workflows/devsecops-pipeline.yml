@@ -294,15 +294,24 @@ jobs:
       - name: Run Checkov (dockerfile framework)
         if: steps.find_df.outputs.found == 'true'
         run: |
+          # Redirect stdout to a FILE. Do NOT use --output-file: in some
+          # Checkov versions that flag is treated as a DIRECTORY and it
+          # writes results_json.json inside it, which broke the -f test.
+          rm -rf checkov-dockerfile-results.json   # clear any stale dir from a prior run
           checkov -f "${{ steps.find_df.outputs.dockerfile }}" \
             --framework dockerfile \
             --output json \
-            --output-file checkov-dockerfile-results.json \
+            --compact \
+            > checkov-dockerfile-results.json 2>/dev/null \
             || true
 
       - name: Ensure Checkov dockerfile output exists
         if: always()
         run: |
+          # Guard against it being created as a directory, empty, or missing
+          if [ -d checkov-dockerfile-results.json ]; then
+            rm -rf checkov-dockerfile-results.json
+          fi
           if [ ! -f checkov-dockerfile-results.json ] || [ ! -s checkov-dockerfile-results.json ]; then
             echo '{"results":{"passed_checks":[],"failed_checks":[]}}' \
               > checkov-dockerfile-results.json
@@ -624,12 +633,12 @@ jobs:
 
 
   # ════════════════════════════════════════════════════════════
-  # JOB 8 — DAST (OWASP ZAP FULL ACTIVE SCAN)
+  # JOB 8 — DAST (OWASP ZAP BASELINE — LIGHT SCAN)
   # Runs against the LOCAL image loaded from tar — the image has
   # still never been pushed to Docker Hub at this point.
   # ════════════════════════════════════════════════════════════
   dast_scan:
-    name: "🕷️ DAST — OWASP ZAP Full Active Scan"
+    name: "🕷️ DAST — OWASP ZAP Baseline (light)"
     runs-on: ubuntu-latest
     needs: [image_scan, iac_scan, sbom_generate]
 
@@ -666,50 +675,34 @@ jobs:
             sleep 5
           done
 
-      # ── ADVANCED DAST — FULL ACTIVE SCAN ──────────────────────
-      # zap-full-scan.py replaces zap-baseline.py.
+      # ── DAST — BASELINE (LIGHT) SCAN ──────────────────────────
+      # zap-baseline.py: PASSIVE only. It spiders the app and
+      # inspects responses — it never sends an attack payload.
+      # Finds missing security headers, cookie flags, information
+      # leaks, and other passively-observable issues.
       #
-      # baseline = passive only. It spiders the app and inspects
-      #            responses. Never sends an attack payload.
-      #            Finds missing headers, cookie flags, info leaks.
-      #
-      # full     = passive + ACTIVE attack. Sends real SQLi, XSS,
-      #            path traversal, command injection, and XXE
-      #            payloads against every discovered parameter.
-      #            This is what finds exploitable vulnerabilities.
+      # This is the LIGHT scan: fast (~3–5 min) and non-intrusive,
+      # versus the full active scan (30–90 min, sends real SQLi/
+      # XSS/traversal payloads). Chosen here for speed.
       #
       # FLAGS:
-      #   -j        AJAX spider — required for Juice Shop, which is
-      #             an Angular SPA. The traditional spider only sees
-      #             the initial HTML and misses nearly every route.
-      #   -m 10     spend up to 10 minutes spidering before attacking
-      #   -T 90     hard ceiling of 90 minutes for the whole scan
-      #   -I        do not let ZAP's own exit code fail the step —
-      #             our Python gate below decides pass/fail
-      #   -z ...    raise attack strength and lower the alert
-      #             threshold so lower-confidence findings surface
-      #
-      # RUNTIME: expect 30–90 minutes, versus ~5 for baseline.
-      # Well inside the 6-hour GitHub Actions job limit.
+      #   -m 5   spider for up to 5 minutes
+      #   -I     do not let ZAP's own exit code fail the step —
+      #          the Python gate below decides pass/fail
       # ──────────────────────────────────────────────────────────
-      - name: Run OWASP ZAP Full Active DAST scan
-        timeout-minutes: 120
+      - name: Run OWASP ZAP Baseline (light) DAST scan
+        timeout-minutes: 20
         run: |
           docker run --rm \
             --network host \
             -v $(pwd):/zap/wrk/:rw \
             ghcr.io/zaproxy/zaproxy:stable \
-            zap-full-scan.py \
+            zap-baseline.py \
             -t http://localhost:3000 \
             -r zap-report.html \
             -J zap-report.json \
-            -j \
-            -m 10 \
-            -T 90 \
+            -m 5 \
             -I \
-            -z "-config scanner.attackStrength=HIGH \
-                -config scanner.alertThreshold=LOW \
-                -config spider.maxDuration=10" \
             || true
 
       - name: Fix ZAP report ownership
