@@ -224,6 +224,138 @@ jobs:
 
 
   # ════════════════════════════════════════════════════════════
+  # JOB 3b — DOCKERFILE SCAN (Hadolint + Checkov dockerfile)
+  #
+  # Fills a gap: SCA (Trivy fs) scans DEPENDENCIES, the image scan
+  # scans the BUILT IMAGE, but nothing checked the Dockerfile's
+  # build INSTRUCTIONS. This catches:
+  #   • running as root / no USER directive
+  #   • :latest or unpinned base images
+  #   • secrets baked into ENV/ARG
+  #   • missing HEALTHCHECK, apt caches left in layers, etc.
+  #
+  # Two tools, deliberately:
+  #   Hadolint  — Dockerfile-specific linter, best-practice rules
+  #   Checkov   — dockerfile framework, security/compliance rules
+  #
+  # AUDIT MODE: prints findings and a warning annotation but does
+  # NOT block. Flip the commented "exit 1" to enforce once the
+  # Dockerfile is clean.
+  # ════════════════════════════════════════════════════════════
+  dockerfile_scan:
+    name: "🐋 Dockerfile Scan — Hadolint + Checkov"
+    runs-on: ubuntu-latest
+    needs: secrets_scan
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Locate Dockerfile
+        id: find_df
+        run: |
+          if [ -f Dockerfile ]; then
+            DF="Dockerfile"
+          else
+            DF=$(find . -maxdepth 2 -iname 'Dockerfile*' -not -path './.git/*' | head -1)
+          fi
+          if [ -z "$DF" ]; then
+            echo "::warning::No Dockerfile found — skipping Dockerfile scan."
+            echo "found=false" >> $GITHUB_OUTPUT
+          else
+            echo "Using Dockerfile: $DF"
+            echo "found=true" >> $GITHUB_OUTPUT
+            echo "dockerfile=$DF" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Hadolint (SARIF) ──────────────────────────────────────
+      - name: Run Hadolint
+        if: steps.find_df.outputs.found == 'true'
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: ${{ steps.find_df.outputs.dockerfile }}
+          format: sarif
+          output-file: hadolint-results.sarif
+          no-fail: true          # never fail the step here; gate decides below
+
+      - name: Ensure Hadolint SARIF exists
+        if: always()
+        run: |
+          if [ ! -f hadolint-results.sarif ] || [ ! -s hadolint-results.sarif ]; then
+            echo '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Hadolint"}},"results":[]}]}' \
+              > hadolint-results.sarif
+          fi
+
+      # ── Checkov dockerfile framework (JSON) ───────────────────
+      - name: Install Checkov
+        if: steps.find_df.outputs.found == 'true'
+        run: pip install checkov --break-system-packages
+
+      - name: Run Checkov (dockerfile framework)
+        if: steps.find_df.outputs.found == 'true'
+        run: |
+          checkov -f "${{ steps.find_df.outputs.dockerfile }}" \
+            --framework dockerfile \
+            --output json \
+            --output-file checkov-dockerfile-results.json \
+            || true
+
+      - name: Ensure Checkov dockerfile output exists
+        if: always()
+        run: |
+          if [ ! -f checkov-dockerfile-results.json ] || [ ! -s checkov-dockerfile-results.json ]; then
+            echo '{"results":{"passed_checks":[],"failed_checks":[]}}' \
+              > checkov-dockerfile-results.json
+          fi
+
+      # ── GATE: AUDIT MODE ──────────────────────────────────────
+      - name: Dockerfile scan gate (AUDIT MODE — not enforcing)
+        run: |
+          HADO=$(python3 -c "
+          import json
+          try:
+              with open('hadolint-results.sarif') as f:
+                  d = json.load(f)
+              errs = [r for r in d.get('runs',[{}])[0].get('results',[])
+                      if r.get('level') == 'error']
+              print(len(errs))
+          except Exception:
+              print(0)
+          ")
+          CKV=$(python3 -c "
+          import json
+          try:
+              with open('checkov-dockerfile-results.json') as f:
+                  d = json.load(f)
+              results = d if isinstance(d, list) else [d]
+              n = 0
+              for r in results:
+                  n += len(r.get('results',{}).get('failed_checks',[]))
+              print(n)
+          except Exception:
+              print(0)
+          ")
+          echo "Hadolint ERROR findings         : $HADO"
+          echo "Checkov dockerfile failed checks: $CKV"
+          TOTAL=$((HADO + CKV))
+          if [ "$TOTAL" -gt "0" ]; then
+            echo "::warning::Dockerfile scan would have FAILED — $HADO Hadolint errors, $CKV Checkov failures (gate in audit mode)"
+            # exit 1   # ← uncomment to enforce once the Dockerfile is clean
+          fi
+          echo "Dockerfile scan: audit mode — pipeline continues regardless."
+
+      - name: Upload Dockerfile scan reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dockerfile-report
+          path: |
+            hadolint-results.sarif
+            checkov-dockerfile-results.json
+          retention-days: 30
+
+
+  # ════════════════════════════════════════════════════════════
   # JOB 4 — BUILD DOCKER IMAGE (LOCAL ONLY — NO PUSH)
   #
   # Build and push are SEPARATE jobs. This job only builds the
@@ -234,7 +366,7 @@ jobs:
   build:
     name: "🐳 Build Docker Image (no push)"
     runs-on: ubuntu-latest
-    needs: [sast_scan, sca_scan]
+    needs: [sast_scan, sca_scan, dockerfile_scan]
 
     outputs:
       version: ${{ steps.calc_version.outputs.version }}
@@ -953,6 +1085,7 @@ jobs:
       - secrets_scan
       - sast_scan
       - sca_scan
+      - dockerfile_scan
       - image_scan
       - iac_scan
       - sbom_generate
