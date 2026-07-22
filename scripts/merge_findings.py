@@ -64,7 +64,7 @@ CHECKOV_SEV_MAP = {
 
 # ── Loaders ───────────────────────────────────────────────────────────────────
 
-def load_sarif(path, tool_hint="SARIF Tool"):
+def load_sarif(path, tool_hint="SARIF Tool", withhold_message=False):
     """
     Parse a SARIF 2.1.0 file.
     Works for Gitleaks (results.sarif) and Semgrep (semgrep-results.sarif).
@@ -114,16 +114,22 @@ def load_sarif(path, tool_hint="SARIF Tool"):
                 file_path = phys.get("artifactLocation", {}).get("uri", "")
                 line      = phys.get("region", {}).get("startLine")
 
-            severity = SARIF_LEVEL_MAP.get(
-                result.get("level", "note"), "Info"
+            severity = (
+                "Critical" if withhold_message
+                else SARIF_LEVEL_MAP.get(result.get("level", "note"), "Info")
             )
 
-            # Prefer full description from rule metadata
-            full_desc = (
-                rule_info.get("fullDescription", {}).get("text", "")
-                or rule_info.get("shortDescription", {}).get("text", "")
-                or msg_text
-            )
+            # Prefer full description from rule metadata.
+            # For secret scanners (Gitleaks), the SARIF message text can
+            # contain the ACTUAL matched secret — never copy it anywhere.
+            if withhold_message:
+                full_desc = "Hard-coded secret detected (value withheld)"
+            else:
+                full_desc = (
+                    rule_info.get("fullDescription", {}).get("text", "")
+                    or rule_info.get("shortDescription", {}).get("text", "")
+                    or msg_text
+                )
 
             findings.append({
                 "title":       f"[{tool_name}] {rule_id}",
@@ -336,7 +342,8 @@ def load_zap(path):
 # ── File → loader routing ─────────────────────────────────────────────────────
 
 FILE_LOADERS = {
-    "results.sarif":             lambda p: load_sarif(p, "Gitleaks"),
+    "results.sarif":             lambda p: load_sarif(p, "Gitleaks",
+                                                      withhold_message=True),
     "semgrep-results.sarif":     lambda p: load_sarif(p, "Semgrep"),
     "trivy-fs-results.json":     lambda p: load_trivy(p, "Trivy-FS"),
     "trivy-image-results.json":  lambda p: load_trivy(p, "Trivy-Image"),
